@@ -1,0 +1,7 @@
+#!/bin/sh
+# 可执行验收服务入口：构建检查 + 代码测试 + API/HTTP 冒烟，以退出码报告结果。
+# 对已运行服务冒烟： BASE_URL=http://127.0.0.1:8080 ./verify
+# 否则自行拉起本地服务进行冒烟。
+set -e
+DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+exec node "$DIR/scripts/verify.mjs" "$@"

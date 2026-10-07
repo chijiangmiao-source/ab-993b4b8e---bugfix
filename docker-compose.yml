@@ -1,0 +1,50 @@
+# 离线探测清单三副本演练 · Docker Compose
+#
+# 启动演练页面/API（宿主端口可配置，默认 8080）：
+#   HOST_PORT=9090 docker compose up web
+# 运行验收服务（构建检查 + 代码测试 + 对 web 服务 API/HTTP 冒烟，结束即退，
+# 退出码即验收结论）：
+#   docker compose up --build --exit-code-from verify verify
+# 或：
+#   docker compose run --build verify ; echo "verify exit=$?"
+
+services:
+  web:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: offline-checklist-drill:latest
+    environment:
+      # 容器内固定监听 3000；宿主映射端口由 HOST_PORT 配置
+      PORT: "3000"
+      HOST: "0.0.0.0"
+    ports:
+      # 可配置宿主端口：HOST_PORT=9090 docker compose up web
+      - "${HOST_PORT:-8080}:3000"
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - "fetch('http://127.0.0.1:3000/healthz').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))"
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 3s
+    restart: unless-stopped
+
+  verify:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: offline-checklist-drill:latest
+    environment:
+      # 对 Compose 网络内的 web 服务做 API/HTTP 冒烟
+      BASE_URL: "http://web:3000"
+    depends_on:
+      web:
+        condition: service_healthy
+    # 一次性验收服务：构建检查 + 代码测试 + HTTP 冒烟；执行结束即退出，
+    # 退出码透传（--exit-code-from / compose run 均以该码报告结果）。
+    entrypoint: ["node", "scripts/verify.mjs"]
+    restart: "no"

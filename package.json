@@ -1,0 +1,16 @@
+{
+  "name": "offline-checklist-drill",
+  "version": "1.0.0",
+  "description": "深空协作组离线探测清单三副本演练：删除绑定新增点、乱序抑制、三方稳定前沿压缩",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "start": "node src/server.mjs",
+    "test": "node --test test/",
+    "verify": "node scripts/verify.mjs"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "license": "MIT"
+}
