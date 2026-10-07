@@ -132,6 +132,45 @@ test('删除必须绑定当时观察到的新增点', () => {
   assert.equal(applyEvent(s, del('B', 'p', 2)).effect, 'deleted');
 });
 
+test('乱序非连续投递：副本仅可见实际收到的版本，未越过删除点的副本阻止压缩', () => {
+  const s = createDrill();
+  // A 依次录入 p 的第 1、2、3 版
+  applyEvent(s, add('A', 'p', 1, 't1'));
+  applyEvent(s, add('A', 'p', 2, 't2'));
+  applyEvent(s, add('A', 'p', 3, 't3'));
+  // B 只收到第 3 版（非连续投递：未收到 1、2）
+  assert.equal(applyEvent(s, add('B', 'p', 3, 't3')).effect, 'added');
+
+  const v1 = view(s);
+  // B 只能显示自己实际收到的第 3 版，不得显示未收到的 1、2
+  assert.deepEqual(v1.visibleAt.B.map((x) => x.seq), [3]);
+  // 非连续投递不得推进 B 的连续观察前沿
+  assert.equal(v1.knownFrontier.p.B, 0);
+  // A 连续录入，三个版本均可见
+  assert.deepEqual(v1.visibleAt.A.map((x) => x.seq), [1, 2, 3]);
+
+  // A 删除至第 2 版；仅 C 对该点发出同步确认
+  assert.equal(applyEvent(s, del('A', 'p', 2)).effect, 'deleted');
+  assert.equal(applyEvent(s, ack('C', 'p', 2)).effect, 'synced');
+
+  // B 未收到也未确认第 2 版 → 不能视为已越过该删除点 → 压缩必须被拒绝
+  const sf = stableFrontier(s);
+  assert.equal(sf.ready, false);
+  assert.deepEqual(sf.items[0].observed, { A: 3, B: 0, C: 2 });
+  const r = compact(s);
+  assert.equal(r.ok, false);
+  assert.equal(r.code, 'FRONTIER_NOT_STABLE');
+
+  // 删除后 B 的视图仍只含实际投递的第 3 版
+  assert.deepEqual(view(s).visibleAt.B.map((x) => x.seq), [3]);
+
+  // B 补齐迟到的 1、2（被墓碑覆盖 → 抑制，但投递即观察）后前沿连续推进，压缩放行
+  assert.equal(applyEvent(s, add('B', 'p', 1, 't1')).effect, 'suppressed');
+  assert.equal(applyEvent(s, add('B', 'p', 2, 't2')).effect, 'suppressed');
+  assert.equal(view(s).knownFrontier.p.B, 3);
+  assert.equal(compact(s).ok, true);
+});
+
 test('只有三方都越过同一删除点才能压缩，压缩移除墓碑并保留证据', () => {
   const s = createDrill();
   applyEvent(s, add('A', 'p', 1, 't1'));

@@ -220,6 +220,31 @@ async function httpSmoke(base) {
   const v3 = (await call('GET', ep)).json.view;
   expect(v3.reopened === 1 && v3.tombstones.length === 0, '重开计数=1 且未产生新墓碑或可见复活条目');
 
+  // 乱序非连续投递场景：B 只收到第 3 版 → 仅第 3 版可见、前沿不推进、压缩拒绝
+  const d2 = await call('POST', '/api/drills', { name: 'verify-out-of-order' });
+  expect(d2.status === 201 && d2.json.id, 'POST /api/drills → 创建乱序场景演练');
+  const ep2 = `/api/drills/${d2.json.id}`;
+  const ev2 = (event) => call('POST', `${ep2}/events`, { event });
+  for (const e of [
+    { type: 'add', replica: 'A', id: 'p', seq: 1, target: 't1' },
+    { type: 'add', replica: 'A', id: 'p', seq: 2, target: 't2' },
+    { type: 'add', replica: 'A', id: 'p', seq: 3, target: 't3' },
+  ]) await ev2(e);
+  const b3 = await ev2({ type: 'add', replica: 'B', id: 'p', seq: 3, target: 't3' });
+  expect(b3.json.results[0].effect === 'added', 'B 乱序收到 p#3（跳过 1、2）被接受');
+  expect(
+    JSON.stringify(b3.json.view.visibleAt.B.map((x) => x.seq)) === '[3]',
+    '非连续投递：B 仅可见实际收到的第 3 版（不得显示 1、2）',
+  );
+  expect(b3.json.view.knownFrontier.p.B === 0, '非连续投递不推进 B 的连续观察前沿（保持 0）');
+  await ev2({ type: 'delete', replica: 'A', id: 'p', seq: 2 });
+  await ev2({ type: 'sync-ack', replica: 'C', id: 'p', seq: 2 });
+  const cX = await call('POST', `${ep2}/compact`, { by: 'A' });
+  expect(
+    cX.status === 409 && cX.json.code === 'FRONTIER_NOT_STABLE',
+    'B 未收到/确认第 2 版 → 不视为越过删除点 → 压缩 409 拒绝',
+  );
+
   // 未知路由
   expect((await call('GET', '/no-such-path')).status === 404, '未知路由 → 404');
 }

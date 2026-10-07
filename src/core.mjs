@@ -21,6 +21,14 @@
  * 5. 同步确认 (sync-ack)：某副本声明已观察到某 id 的某个新增点。
  * 6. 重开 (reopen)：演练可重开继续录入；已压缩历史不复活。
  *
+ * 副本观察前沿
+ * ------------
+ * 每个副本按 id 维护“实际持有的版本集合”（投递即持有，含被抑制的
+ * 迟到旧新增）。副本的观察前沿是持有版本的**连续前缀**（同步确认可
+ * 声明式抬升）：乱序收到 seq=3 而未收到 1、2 时，该副本仅第 3 版
+ * 可见，前沿保持 0 —— 不得把未收到的中间版本算作已观察，也不得
+ * 据此在压缩时视为已越过删除点。
+ *
  * 非法事件以 { ok:false, code, error } 拒绝并记入 rejected，且不修改状态。
  */
 
@@ -118,7 +126,8 @@ export function validateEvent(rawEv, state) {
           };
         }
         // 同副本重复收到同一 seq 即消息重放；另一副本首次收到则是新交付
-        const duplicate = (state.observed[ev.id]?.[replica] ?? 0) >= ev.seq;
+        const duplicate =
+          (state.observed[ev.id]?.[replica] ?? 0) >= ev.seq || state.held[ev.id]?.[replica]?.has(ev.seq) === true;
         return { ok: true, ev, duplicate };
       }
       // 从未见过的 seq：
@@ -194,7 +203,8 @@ export function createDrill(name = '未命名演练') {
     //         sealed: Map<seq,targetStr>（曾出现过的全部载荷指纹，用于冲突识别）,
     //         maxSeq, compactedUpTo }
     entries: Object.create(null),
-    observed: Object.create(null), // id -> { A:n, B:n, C:n }
+    observed: Object.create(null), // id -> { A:n, B:n, C:n }（连续观察前沿）
+    held: Object.create(null), // id -> { A:Set, B:Set, C:Set }（各副本实际收到的版本）
     tombstones: Object.create(null), // id -> { upToSeq, by:[...], at }
     suppressed: [], // 被抑制的迟到旧新增（证据）
     rejected: [], // 被明确拒绝的非法事件（证据）
@@ -214,8 +224,21 @@ function entryOf(state, id) {
       compactedUpTo: 0,
     };
     state.observed[id] = { A: 0, B: 0, C: 0 };
+    state.held[id] = { A: new Set(), B: new Set(), C: new Set() };
   }
   return state.entries[id];
+}
+
+/**
+ * 副本观察前沿只能沿“实际持有的版本”连续推进：
+ * 乱序收到 seq=3 而未持有 1、2 时前沿保持 0，不会凭空越过缺口。
+ */
+function advanceFrontier(state, id, replica) {
+  const obs = state.observed[id];
+  const held = state.held[id][replica];
+  let f = obs[replica];
+  while (held.has(f + 1)) f += 1;
+  obs[replica] = f;
 }
 
 /** 某 id 当前删除覆盖点：墓碑优先，否则取已压缩水位 */
@@ -276,10 +299,14 @@ function applyAdd(state, ev) {
   const { id, seq, target, replica } = ev;
   const entry = entryOf(state, id);
 
-  // 先记录“该副本是否已持有此版本”（必须在更新 observed 之前判断）
-  const alreadyHeld = entry.versions.has(seq) && state.observed[id][replica] >= seq;
-  // 投递即观察：即便消息随后被抑制，副本也确实收到了该新增点
-  state.observed[id][replica] = Math.max(state.observed[id][replica], seq);
+  // 先记录“该副本是否已持有此版本”（必须在登记持有之前判断）：
+  // 已实际收到过，或连续前沿已越过该点（如 sync-ack 声明），均为纯重放
+  const alreadyHeld = state.held[id][replica].has(seq) || state.observed[id][replica] >= seq;
+  // 投递即持有：即便消息随后被抑制，副本也确实收到了该新增点。
+  // 但乱序/非连续投递只登记实际收到的这个版本，观察前沿仅沿连续持有
+  // 推进 —— 收到 seq=3 不等于已观察 1、2。
+  state.held[id][replica].add(seq);
+  advanceFrontier(state, id, replica);
 
   // 被删除上下文覆盖（墓碑区间或已压缩水位）→ 抑制，不成可见条目不建墓碑。
   // 即使该副本已通过 sync-ack 越过此点，迟到的旧新增仍作为抑制证据留痕。
@@ -357,7 +384,10 @@ function applySyncAck(state, ev) {
   entryOf(state, id);
   const prev = state.observed[id][replica];
   if (seq <= prev) return 'sync-duplicate';
+  // sync-ack 是副本对“已观察到 seq”的声明：前沿抬升至该点，
+  // 再沿实际持有的更高版本连续推进
   state.observed[id][replica] = seq;
+  advanceFrontier(state, id, replica);
   return 'synced';
 }
 
@@ -439,13 +469,14 @@ export function view(state) {
   }
   visible.sort((a, b) => (a.id === b.id ? a.seq - b.seq : a.id < b.id ? -1 : 1));
 
-  // 各副本视角：版本已被该副本观察到（observed >= seq）且高于删除覆盖点
+  // 各副本视角：版本在该副本的连续观察前沿之内，或该副本实际收到过
+  // 这一版本（乱序高版本），且高于删除覆盖点
   const visibleAt = { A: [], B: [], C: [] };
   for (const item of visible) {
     for (const r of REPLICAS) {
-      if ((state.observed[item.id]?.[r] ?? 0) >= item.seq) {
-        visibleAt[r].push(item);
-      }
+      const delivered =
+        (state.observed[item.id]?.[r] ?? 0) >= item.seq || state.held[item.id]?.[r]?.has(item.seq) === true;
+      if (delivered) visibleAt[r].push(item);
     }
   }
 
